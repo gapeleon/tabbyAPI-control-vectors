@@ -47,7 +47,7 @@ def get_install_features(lib_name: str = None):
         # Ask the user for the GPU lib
         gpu_lib_choices = {
             "A": {"pretty": "NVIDIA Cuda 12.x", "internal": "cu121"},
-            "B": {"pretty": "NVIDIA Cuda 11.8", "internal": "cu118"},
+            "B": {"pretty": "NVIDIA Cuda 11.8 (Unsupported)", "internal": "cu118"},
             "C": {"pretty": "AMD", "internal": "amd"},
         }
         user_input = get_user_choice(
@@ -272,10 +272,7 @@ if __name__ == "__main__":
 
     # Assume all dependencies are installed from here
     try:
-        from common.args import convert_args_to_dict
         from main import entrypoint
-
-        converted_args = convert_args_to_dict(args, parser)
 
         # Create a config if it doesn't exist
         # This is not necessary to run TabbyAPI, but is new user proof
@@ -292,7 +289,7 @@ if __name__ == "__main__":
             )
 
         print("Starting TabbyAPI...")
-        entrypoint(converted_args)
+        entrypoint(args, parser)
     except (ModuleNotFoundError, ImportError):
         traceback.print_exc()
         print(

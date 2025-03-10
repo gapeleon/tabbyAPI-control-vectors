@@ -94,7 +94,8 @@ class ExllamaV2Container:
     generation_config: Optional[GenerationConfig] = None
 
     # GPU split vars
-    gpu_split: Optional[list] = None
+    gpu_split: List[float] = []
+    draft_gpu_split: List[float] = []
     gpu_split_auto: bool = True
     autosplit_reserve: List[float] = [96 * 1024**2]
     use_tp: bool = False
@@ -194,6 +195,7 @@ class ExllamaV2Container:
             )
             draft_model_path = draft_model_path / draft_model_name
 
+            self.draft_gpu_split = unwrap(draft_args.get("draft_gpu_split"), [])
             self.draft_model_dir = draft_model_path
             self.draft_config.model_dir = str(draft_model_path.resolve())
             self.draft_config.prepare()
@@ -207,7 +209,7 @@ class ExllamaV2Container:
         gpu_count = torch.cuda.device_count()
         gpu_split_auto = unwrap(kwargs.get("gpu_split_auto"), True)
         use_tp = unwrap(kwargs.get("tensor_parallel"), False)
-        gpu_split = kwargs.get("gpu_split")
+        gpu_split = unwrap(kwargs.get("gpu_split"), [])
         gpu_device_list = list(range(0, gpu_count))
 
         # Set GPU split options
@@ -244,6 +246,15 @@ class ExllamaV2Container:
                 self.autosplit_reserve = [
                     int(math.ceil(value * 1024**2))
                     for value in autosplit_reserve_megabytes
+                ]
+
+            # Change the GPU device list only if gpu_split's list is too small
+            # This allows for an uneven list specification
+            if self.draft_gpu_split and len(self.draft_gpu_split) > len(self.gpu_split):
+                gpu_device_list = [
+                    device_idx
+                    for device_idx, memory in enumerate(self.draft_gpu_split)
+                    if memory > 0
                 ]
 
         # Hardcode max output length to 16
@@ -389,6 +400,7 @@ class ExllamaV2Container:
             # Set draft cache mode
             self.draft_cache_mode = unwrap(draft_args.get("draft_cache_mode"), "FP16")
 
+            # Edit the draft config size
             if chunk_size:
                 self.draft_config.max_input_len = chunk_size
                 self.draft_config.max_attention_size = chunk_size**2
@@ -500,15 +512,17 @@ class ExllamaV2Container:
             "rope_scale": self.config.scale_pos_emb,
             "rope_alpha": self.config.scale_alpha_value,
             "max_seq_len": self.config.max_seq_len,
+            "max_batch_size": self.max_batch_size,
             "cache_size": self.cache_size,
             "cache_mode": self.cache_mode,
             "chunk_size": self.config.max_input_len,
             "num_experts_per_token": self.config.num_experts_per_token,
-            "prompt_template": self.prompt_template.name
-            if self.prompt_template
-            else None,
             "use_vision": self.use_vision,
         }
+
+        if self.prompt_template:
+            model_params["prompt_template"] = self.prompt_template.name
+            model_params["prompt_template_content"] = self.prompt_template.raw_template
 
         if self.draft_config:
             draft_model_params = {
@@ -631,21 +645,41 @@ class ExllamaV2Container:
 
             # Draft uses the autosplit loader, so create a cache that reflects this
             draft_cache_class = self.get_cache_class(self.draft_cache_mode)
-            self.draft_cache = self.create_cache(
-                cache_class=draft_cache_class,
-                autosplit=True,
-                use_tp=False,
-                model=self.draft_model,
-            )
 
-            for value in self.draft_model.load_autosplit_gen(
-                self.draft_cache,
-                reserve_vram=autosplit_reserve,
-                last_id_only=True,
-                callback_gen=progress_callback,
-            ):
-                if value:
-                    yield value
+            if self.draft_gpu_split:
+                logger.info("Loading with a manual GPU split (or a one GPU setup)")
+
+                for value in self.draft_model.load_gen(
+                    self.draft_gpu_split,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
+
+                self.draft_cache = self.create_cache(
+                    cache_class=draft_cache_class,
+                    autosplit=False,
+                    use_tp=False,
+                    model=self.draft_model,
+                )
+            else:
+                logger.info("Loading with autosplit")
+
+                self.draft_cache = self.create_cache(
+                    cache_class=draft_cache_class,
+                    autosplit=True,
+                    use_tp=False,
+                    model=self.draft_model,
+                )
+
+                for value in self.draft_model.load_autosplit_gen(
+                    self.draft_cache,
+                    reserve_vram=autosplit_reserve,
+                    last_id_only=True,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
 
             # Test VRAM allocation with a full-length forward pass
             input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
@@ -671,8 +705,10 @@ class ExllamaV2Container:
         if self.use_tp:
             logger.info("Loading with tensor parallel")
 
+            # GPU split must be None if the array is empty
+            # Otherwise the TP loader fails
             for value in self.model.load_tp_gen(
-                self.gpu_split,
+                self.gpu_split or None,
                 callback_gen=progress_callback,
                 expect_cache_base=cache_class,
                 expect_cache_tokens=self.cache_size,
@@ -783,6 +819,10 @@ class ExllamaV2Container:
                 max_batch_size=self.max_batch_size,
                 paged=self.paged,
             )
+
+            # Update the state of the container var
+            if self.max_batch_size is None:
+                self.max_batch_size = self.generator.generator.max_batch_size
         finally:
             # This means the generator is being recreated
             # The load lock is already released in the load function
@@ -1325,17 +1365,49 @@ class ExllamaV2Container:
 
         # The first index will always be the positive prompt
         context_len = input_ids[0].size(dim=-1)
-        if context_len > self.config.max_seq_len:
-            raise ValueError(
-                f"Context length {context_len} is greater than max_seq_len "
-                f"{self.config.max_seq_len}"
-            )
+
+        # The second index will be the negative prompt if CFG is enabled
+        negative_context_len = input_ids[1].size(dim=-1) if negative_prompt else 0
 
         # Automatically set max_tokens to fill up the context
         # This should be an OK default, but may be changed in the future
         max_tokens = unwrap(
-            kwargs.get("max_tokens"), self.config.max_seq_len - context_len
+            kwargs.get("max_tokens"),
+            self.config.max_seq_len - max(context_len, negative_context_len),
         )
+        if max_tokens < 1:
+            logger.warning("max_tokens must be a positive integer, setting to 1.")
+            max_tokens = 1
+
+        # Determine if the negative context or the context length is bigger
+        context_to_check = max(negative_context_len, context_len)
+
+        # Check highest possible total length of request
+        if context_to_check + max_tokens > self.config.max_seq_len:
+            preamble = (
+                "Negative prompt request"
+                if negative_context_len > context_len
+                else "Request"
+            )
+
+            raise ValueError(
+                f"{preamble} length {context_to_check} + {max_tokens} is greater than "
+                f"max_seq_len {self.config.max_seq_len}"
+            )
+
+        # Check total required pages for CFG request to avoid overallocation
+        if negative_prompt and (
+            sum(
+                256 * math.ceil((context + max_tokens) / 256)
+                for context in (context_len, negative_context_len)
+            )
+            > self.cache_size
+        ):
+            raise ValueError(
+                f"Total required page size for request "
+                f"{context_len} + {negative_context_len} + {max_tokens} * 2 "
+                f"is greater than cache_size {self.cache_size}"
+            )
 
         # Set min_tokens to generate while keeping EOS banned
         min_tokens = unwrap(kwargs.get("min_tokens"), 0)

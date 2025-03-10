@@ -16,10 +16,12 @@ class ModelCardParameters(BaseModel):
     max_seq_len: Optional[int] = None
     rope_scale: Optional[float] = 1.0
     rope_alpha: Optional[float] = 1.0
+    max_batch_size: Optional[int] = 1
     cache_size: Optional[int] = None
     cache_mode: Optional[str] = "FP16"
     chunk_size: Optional[int] = 2048
     prompt_template: Optional[str] = None
+    prompt_template_content: Optional[str] = None
     num_experts_per_token: Optional[int] = None
     use_vision: Optional[bool] = False
 
@@ -61,7 +63,10 @@ class DraftModelLoadRequest(BaseModel):
         default=None,
         examples=[1.0],
     )
-    draft_cache_mode: Optional[str] = None
+    draft_gpu_split: Optional[List[float]] = Field(
+        default_factory=list,
+        examples=[[24.0, 20.0]],
+    )
 
 
 class ModelLoadRequest(BaseModel):
@@ -92,7 +97,7 @@ class ModelLoadRequest(BaseModel):
     gpu_split_auto: Optional[bool] = None
     autosplit_reserve: Optional[List[float]] = None
     gpu_split: Optional[List[float]] = Field(
-        default=None,
+        default_factory=list,
         examples=[[24.0, 20.0]],
     )
     rope_scale: Optional[float] = Field(
@@ -139,3 +144,17 @@ class ModelLoadResponse(BaseModel):
     module: int
     modules: int
     status: str
+
+
+class ModelDefaultGenerationSettings(BaseModel):
+    """Contains default generation settings for model props."""
+
+    n_ctx: int
+
+
+class ModelPropsResponse(BaseModel):
+    """Represents a model props response."""
+
+    total_slots: int = 1
+    chat_template: str = ""
+    default_generation_settings: ModelDefaultGenerationSettings
